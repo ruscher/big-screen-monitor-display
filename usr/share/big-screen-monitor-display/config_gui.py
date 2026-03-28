@@ -110,15 +110,17 @@ class BigScreenConfigWindow(Adw.ApplicationWindow):
         page.add(group_display)
 
         # Modelos
-        model_model = Gtk.StringList.new(["Detectar Automaticamente", "AX206 (Turing Smart Screen)", "Outro (Genérico)"])
+        model_model = Gtk.StringList.new(["Detectar Automaticamente", "AX206 (USB SCSI)", "Turing Smart Screen (USB Serial)", "Outro (Genérico)"])
         self.combo_model = Adw.ComboRow(title="Modelo do Display", subtitle="Padrão: Auto", model=model_model)
         
         if self.settings["model"] == "auto":
             self.combo_model.set_selected(0)
         elif self.settings["model"] == "ax206":
             self.combo_model.set_selected(1)
-        else:
+        elif self.settings["model"] == "turing":
             self.combo_model.set_selected(2)
+        else:
+            self.combo_model.set_selected(3)
         group_display.add(self.combo_model)
 
         # Tamanho
@@ -291,7 +293,7 @@ class BigScreenConfigWindow(Adw.ApplicationWindow):
         return menu_button
 
     def _get_current_settings(self):
-        model_map = {0: "auto", 1: "ax206", 2: "other"}
+        model_map = {0: "auto", 1: "ax206", 2: "turing", 3: "other"}
         size_map = {0: "3.5", 1: "5", 2: "8.8", 3: "2.1"}
         theme_map = {0: "dark", 1: "light", 2: "neon", 3: "cyberpunk", 4: "gkrellm"}
         net_map = {0: "auto", 1: "eth", 2: "wifi"}

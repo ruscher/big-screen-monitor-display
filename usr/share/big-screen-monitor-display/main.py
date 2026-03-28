@@ -15,6 +15,9 @@ from datetime import datetime, timedelta
 import usb.core
 import usb.util
 import psutil
+import numpy as np
+import serial
+from serial.tools.list_ports import comports
 from PIL import Image, ImageDraw, ImageFont
 
 STATS_LOCK = threading.Lock()
@@ -163,6 +166,41 @@ NET_TX_HISTORY = [0] * 30
 
 # Cache Global de Icones SVG 
 ICON_CACHE = {}
+
+_LOGO_CACHE = {}
+
+def load_distro_logo(logo_name, size):
+    """Load distro logo from /usr/share/pixmaps/, supporting PNG and SVG."""
+    cache_key = f"{logo_name}_{size}"
+    if cache_key in _LOGO_CACHE:
+        return _LOGO_CACHE[cache_key]
+
+    base = f"/usr/share/pixmaps/{logo_name}"
+    for ext in (".png", ".svg"):
+        path = base + ext
+        if not os.path.exists(path):
+            continue
+        try:
+            if ext == ".svg":
+                p = subprocess.run(
+                    ["rsvg-convert", "-w", str(size), "-h", str(size), path],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+                if p.returncode == 0:
+                    logo = Image.open(io.BytesIO(p.stdout)).convert("RGBA")
+                    _LOGO_CACHE[cache_key] = logo
+                    return logo
+            else:
+                logo = Image.open(path).convert("RGBA")
+                try:
+                    resamp = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resamp = 1
+                logo.thumbnail((size, size), resamp)
+                _LOGO_CACHE[cache_key] = logo
+                return logo
+        except Exception:
+            continue
+    return None
 
 def get_svg_icon(name, size, color=None):
     cache_key = f"{name}_{size}_{color}"
@@ -656,6 +694,249 @@ class AX206_DPF:
         
         self.scsi_wrap(cmd, dir_out=True, data=rgb565)
 
+
+class TuringSmartScreen:
+    """Driver for QinHeng Electronics UsbMonitor (VID 0x1a86, PID 0x5722).
+
+    Uses USB-CDC serial protocol (ttyACM) as documented by the
+    turing-smart-screen-python project (GPL-3.0, by @mathoudebine).
+    """
+
+    # Protocol command codes
+    CMD_RESET = 101
+    CMD_CLEAR = 102
+    CMD_SCREEN_OFF = 108
+    CMD_SCREEN_ON = 109
+    CMD_SET_BRIGHTNESS = 110
+    CMD_SET_ORIENTATION = 121
+    CMD_DISPLAY_BITMAP = 197
+    CMD_HELLO = 69
+
+    @staticmethod
+    def find_com_port():
+        """Auto-detect the serial port for the Turing Smart Screen."""
+        for port in comports():
+            if getattr(port, "serial_number", None) == "USB35INCHIPSV2":
+                return port.device
+            if getattr(port, "vid", None) == 0x1A86 and getattr(port, "pid", None) == 0x5722:
+                return port.device
+        return None
+
+    def __init__(self, com_port=None):
+        if com_port is None:
+            com_port = self.find_com_port()
+        if com_port is None:
+            raise RuntimeError("Turing Smart Screen not found on any serial port")
+
+        self.com_port = com_port
+        self.lcd_serial = serial.Serial(self.com_port, 115200, timeout=1, rtscts=True)
+
+        # Default 3.5" dimensions (portrait native)
+        self.native_width = 320
+        self.native_height = 480
+        self._detect_model()
+
+        # Expose width/height in landscape (matches AX206_DPF convention)
+        self.width = self.native_height  # 480
+        self.height = self.native_width  # 320
+
+        # Set landscape orientation once at init (avoids per-frame overhead)
+        self._orientation_set = False
+        # Previous frame for dirty-rectangle optimization
+        self._prev_frame = None
+
+    def _detect_model(self):
+        """Send HELLO command to identify display model and resolution."""
+        hello = bytes([self.CMD_HELLO] * 6)
+        self.lcd_serial.write(hello)
+        resp = self.lcd_serial.read(6)
+        self.lcd_serial.reset_input_buffer()
+
+        if resp == bytes([0x01] * 6):
+            self.native_width, self.native_height = 320, 480
+        elif resp == bytes([0x02] * 6):
+            self.native_width, self.native_height = 480, 800
+        elif resp == bytes([0x03] * 6):
+            self.native_width, self.native_height = 600, 1024
+        else:
+            # Turing 3.5" original does not respond to HELLO
+            self.native_width, self.native_height = 320, 480
+
+    def _send_command(self, cmd, x=0, y=0, ex=0, ey=0):
+        buf = bytearray(6)
+        buf[0] = (x >> 2)
+        buf[1] = (((x & 3) << 6) + (y >> 4))
+        buf[2] = (((y & 15) << 4) + (ex >> 6))
+        buf[3] = (((ex & 63) << 2) + (ey >> 8))
+        buf[4] = (ey & 255)
+        buf[5] = cmd
+        self.lcd_serial.write(bytes(buf))
+
+    def _set_orientation_cmd(self, orientation_code, width, height):
+        """Send the 16-byte orientation command."""
+        buf = bytearray(16)
+        buf[0] = 0
+        buf[1] = 0
+        buf[2] = 0
+        buf[3] = 0
+        buf[4] = 0
+        buf[5] = self.CMD_SET_ORIENTATION
+        buf[6] = orientation_code + 100
+        buf[7] = (width >> 8)
+        buf[8] = (width & 255)
+        buf[9] = (height >> 8)
+        buf[10] = (height & 255)
+        self.lcd_serial.write(bytes(buf))
+
+    def set_backlight(self, b):
+        """Set brightness. Maps 10-100% range to 0-255 (0=brightest)."""
+        if b <= 0:
+            level_abs = 255
+        elif b >= 100:
+            level_abs = 0
+        else:
+            level_abs = int(255 - ((b / 100) * 255))
+        self._send_command(self.CMD_SET_BRIGHTNESS, level_abs, 0, 0, 0)
+
+    def draw(self, image, settings=None):
+        """Draw a PIL Image with tile-based dirty detection.
+
+        Divides the screen into small tiles (48x20 pixels).  Only tiles whose
+        pixels actually changed are sent.  Dirty tiles within the same row are
+        merged into wider rectangles to reduce USB command overhead, then the
+        row groups are sent in shuffled order so the visual update is spread
+        across the whole screen instead of scanning top-to-bottom.
+        """
+        if settings and settings.get("orientation") == "vertical":
+            image = image.rotate(90, expand=True)
+
+        img_w, img_h = image.size
+
+        # Set orientation only once
+        if not self._orientation_set:
+            self._set_orientation_cmd(2, img_w, img_h)
+            self._orientation_set = True
+
+        # Convert image to RGB565 little-endian using numpy
+        rgb565le = self._image_to_rgb565(image)
+
+        if self._prev_frame is not None and len(self._prev_frame) == len(rgb565le):
+            # Tile-based dirty detection
+            tile_w, tile_h = 48, 20
+            cols = img_w // tile_w   # 10 for 480px
+            rows = img_h // tile_h   # 16 for 320px
+
+            curr = np.frombuffer(rgb565le, dtype="<u2").reshape(img_h, img_w)
+            prev = np.frombuffer(self._prev_frame, dtype="<u2").reshape(img_h, img_w)
+
+            # Reshape into tile grid: (rows, cols, tile_h, tile_w)
+            curr_tiles = curr[:rows * tile_h, :cols * tile_w].reshape(
+                rows, tile_h, cols, tile_w).transpose(0, 2, 1, 3)
+            prev_tiles = prev[:rows * tile_h, :cols * tile_w].reshape(
+                rows, tile_h, cols, tile_w).transpose(0, 2, 1, 3)
+
+            # Vectorized comparison: which tiles changed?
+            tile_changed = (curr_tiles != prev_tiles).any(axis=(2, 3))
+
+            if not tile_changed.any():
+                return False  # Nothing changed
+
+            # Merge horizontally adjacent dirty tiles into wider rectangles
+            # to reduce the number of USB transactions
+            rects = []  # list of (y0, x0, x1_excl, row_idx) — merged rects
+            for ty in range(rows):
+                tx = 0
+                while tx < cols:
+                    if not tile_changed[ty, tx]:
+                        tx += 1
+                        continue
+                    # Start of a run of dirty tiles in this row
+                    tx_start = tx
+                    while tx < cols and tile_changed[ty, tx]:
+                        tx += 1
+                    # Merged rectangle: full tile_h height, tx_start..tx columns
+                    y0 = ty * tile_h
+                    x0 = tx_start * tile_w
+                    x1 = tx * tile_w  # exclusive
+                    rects.append((y0, x0, x1, ty))
+
+            # Shuffle rectangles so the visual update is distributed across
+            # the whole screen rather than sweeping top-to-bottom
+            import random
+            random.shuffle(rects)
+
+            for y0, x0, x1, ty in rects:
+                rect_data = curr[y0:y0 + tile_h, x0:x1].tobytes()
+                self._send_command(self.CMD_DISPLAY_BITMAP,
+                                   x0, y0, x1 - 1, y0 + tile_h - 1)
+                self.lcd_serial.write(rect_data)
+
+            self._prev_frame = rgb565le
+            return True
+        else:
+            # First frame or size changed: send everything
+            self._send_command(self.CMD_DISPLAY_BITMAP, 0, 0, img_w - 1, img_h - 1)
+            chunk_size = img_w * 8
+            for i in range(0, len(rgb565le), chunk_size):
+                self.lcd_serial.write(rgb565le[i:i + chunk_size])
+
+            self._prev_frame = rgb565le
+            return True
+
+    def _draw_rgb565(self, rgb565, width, height):
+        """Send pre-converted RGB565 data. Converts from big-endian to little-endian."""
+        self._set_orientation_cmd(2, width, height)
+
+        x1, y1 = width - 1, height - 1
+        self._send_command(self.CMD_DISPLAY_BITMAP, 0, 0, x1, y1)
+
+        # The existing code produces big-endian RGB565; we need little-endian
+        data = bytearray(rgb565)
+        for i in range(0, len(data), 2):
+            data[i], data[i + 1] = data[i + 1], data[i]
+
+        chunk_size = width * 8
+        for i in range(0, len(data), chunk_size):
+            self.lcd_serial.write(bytes(data[i:i + chunk_size]))
+
+    @staticmethod
+    def _image_to_rgb565(image):
+        """Convert PIL Image to RGB565 little-endian bytes using numpy."""
+        if image.mode not in ("RGB", "RGBA"):
+            image = image.convert("RGB")
+        rgb = np.asarray(image).reshape((image.size[1] * image.size[0], -1))
+        r = rgb[:, 0].astype(np.uint16) >> 3
+        g = rgb[:, 1].astype(np.uint16) >> 2
+        b = rgb[:, 2].astype(np.uint16) >> 3
+        rgb565 = (r << 11) | (g << 5) | b
+        return rgb565.astype("<u2").tobytes()
+
+    def close(self):
+        if self.lcd_serial and self.lcd_serial.is_open:
+            self.lcd_serial.close()
+
+
+def detect_display(settings):
+    """Factory: detect and instantiate the appropriate display driver."""
+    model = settings.get("model", "auto")
+
+    if model == "turing":
+        return TuringSmartScreen()
+    elif model == "ax206":
+        return AX206_DPF()
+
+    # Auto-detection: try Turing first (serial), then AX206 (USB)
+    turing_port = TuringSmartScreen.find_com_port()
+    if turing_port:
+        return TuringSmartScreen(com_port=turing_port)
+
+    ax206_dev = usb.core.find(idVendor=0x1908, idProduct=0x0102)
+    if ax206_dev:
+        return AX206_DPF()
+
+    raise RuntimeError("No supported display found")
+
+
 # ================= RENDERIZACAO DA TELA =================
 
 def get_os_release():
@@ -850,19 +1131,15 @@ def render_dashboard_gkrellm(width, height, settings):
         if request_space(80):
             os_info = get_os_release()
             logo_name = os_info.get("LOGO", "")
-            logo_path = f"/usr/share/pixmaps/{logo_name}.png"
             hn = SYSTEM_STATS.get('hostname', 'URSPECHT')
             krn = SYSTEM_STATS.get('kernel', 'Linux')
             tw = get_text_width(d, hn, font_mono_lg)
             kw = get_text_width(d, krn, font_mono_sm)
             
-            if os.path.exists(logo_path):
-                try:
-                    logo = Image.open(logo_path).convert("RGBA")
-                    logo.thumbnail((45, 45), Image.Resampling.LANCZOS)
-                    img.paste(logo, (cx + (cw - logo.width)//2, cy), mask=logo)
-                    cy += logo.height + 5
-                except: pass
+            logo = load_distro_logo(logo_name, 45)
+            if logo:
+                img.paste(logo, (cx + (cw - logo.width)//2, cy), mask=logo)
+                cy += logo.height + 5
                 
             d.text((cx + (cw - tw)//2, cy), hn, fill=font_dim, font=font_mono_lg)
             cy += 30
@@ -1350,21 +1627,11 @@ def render_dashboard_portrait(width, height, settings):
     d.rounded_rectangle((10, 10, width-10, header_h), radius=10, fill=theme_colors["panel_bg"])
     
     # Logo
-    logo_path = f"/usr/share/pixmaps/{logo_name}.png"
     logo_offset = 20
-    if os.path.exists(logo_path):
-        try:
-            logo = Image.open(logo_path).convert("RGBA")
-            l_h = header_h - 30
-            try:
-                resamp = Image.Resampling.LANCZOS
-            except AttributeError:
-                resamp = 1
-            logo.thumbnail((l_h, l_h), resamp)
-            img.paste(logo, (20, 15), mask=logo)
-            logo_offset = logo.width + 30
-        except Exception:
-            pass
+    logo = load_distro_logo(logo_name, header_h - 30)
+    if logo:
+        img.paste(logo, (20, 15), mask=logo)
+        logo_offset = logo.width + 30
 
     # Simple clock in header
     now = datetime.now().strftime("%H:%M")
@@ -1373,8 +1640,8 @@ def render_dashboard_portrait(width, height, settings):
     
     # OS Name (font reduced) + Host + Kernel (Split lines)
     d.text((logo_offset, 18), pretty_name[:20], fill=theme_colors["text_main"], font=font_md)
-    d.text((logo_offset, 48), f"{SYSTEM_STATS['hostname']}", fill=theme_colors["text_muted"], font=font_sm)
-    d.text((logo_offset, 74), f"{SYSTEM_STATS['kernel']}", fill=theme_colors["text_muted"], font=font_sm)
+    d.text((logo_offset, 36), f"{SYSTEM_STATS['hostname']}", fill=theme_colors["text_muted"], font=font_sm)
+    d.text((logo_offset, 50), f"{SYSTEM_STATS['kernel']}", fill=theme_colors["text_muted"], font=font_sm)
 
     # Rede RX / TX below clock
     net_rx_icon = get_svg_icon("rx-symbolic.svg", int(height*0.022), theme_colors["icon_color"])
@@ -1388,15 +1655,15 @@ def render_dashboard_portrait(width, height, settings):
     
     # Position TX first (rightmost)
     tx_x = width - tx_w - 20
-    d.text((tx_x, 55), net_tx_t, fill=theme_colors["good"], font=font_sm)
+    d.text((tx_x, 43), net_tx_t, fill=theme_colors["good"], font=font_sm)
     if net_tx_icon:
-        img.paste(net_tx_icon, (tx_x - icon_sz - 4, 57), net_tx_icon)
+        img.paste(net_tx_icon, (tx_x - icon_sz - 4, 45), net_tx_icon)
         
     # Position RX to the left of TX
     rx_x = tx_x - icon_sz - 15 - rx_w
-    d.text((rx_x, 55), net_rx_t, fill=theme_colors["good"], font=font_sm)
+    d.text((rx_x, 43), net_rx_t, fill=theme_colors["good"], font=font_sm)
     if net_rx_icon:
-        img.paste(net_rx_icon, (rx_x - icon_sz - 4, 57), net_rx_icon)
+        img.paste(net_rx_icon, (rx_x - icon_sz - 4, 45), net_rx_icon)
 
     # === PROGRESS BAR HELPER ===
     def draw_bar(x, y, w, h, percent, label, text_val, color, icon_name=""):
@@ -1414,7 +1681,8 @@ def render_dashboard_portrait(width, height, settings):
         by = y + int(height * 0.035)
         d.rounded_rectangle((x, by, x + w, by + h), radius=h//2, fill=theme_colors["bar_bg"])
         fill_w = int(w * (percent / 100))
-        if fill_w > h:
+        if fill_w > 0:
+            fill_w = max(fill_w, h)
             d.rounded_rectangle((x, by, x + fill_w, by + h), radius=h//2, fill=color)
 
     # === VERTICAL STACK ===
@@ -1450,7 +1718,8 @@ def render_dashboard_portrait(width, height, settings):
     by = curr_y + int(height * 0.035)
     d.rounded_rectangle((20, by, 20 + cpu_w, by + row_h), radius=row_h//2, fill=theme_colors["bar_bg"])
     fill_w = int(cpu_w * (SYSTEM_STATS["cpu_percent"] / 100))
-    if fill_w > row_h:
+    if fill_w > 0:
+        fill_w = max(fill_w, row_h)
         d.rounded_rectangle((20, by, 20 + fill_w, by + row_h), radius=row_h//2, fill=theme_colors["warn"])
              
     # Graph on the right of CPU
@@ -1575,9 +1844,10 @@ def render_dashboard_landscape(width, height, settings):
         font_lg = ImageFont.truetype(os.path.join(font_dir, "DejaVuSans-Bold.ttf"), int(height * 0.050))  
         font_md = ImageFont.truetype(os.path.join(font_dir, "DejaVuSans-Bold.ttf"), int(height * 0.038))  
         font_sm = ImageFont.truetype(os.path.join(font_dir, "DejaVuSans.ttf"), int(height * 0.035))       
+        font_proc = ImageFont.truetype(os.path.join(font_dir, "DejaVuSans.ttf"), int(height * 0.028))
         font_icon = ImageFont.truetype(os.path.join(font_dir, "DejaVuSans.ttf"), int(height * 0.022))     
     except Exception:
-        font_time = font_md = font_sm = ImageFont.load_default()
+        font_time = font_md = font_sm = font_proc = ImageFont.load_default()
 
     os_info = get_os_release()
     pretty_name = os_info.get("PRETTY_NAME", "Linux OS")
@@ -1591,23 +1861,18 @@ def render_dashboard_landscape(width, height, settings):
         d.rectangle((10, 10, width-10, header_h), fill=theme_colors["panel_bg"])
     
     # Logo
-    logo_path = f"/usr/share/pixmaps/{logo_name}.png"
-    if os.path.exists(logo_path):
-        try:
-            logo = Image.open(logo_path).convert("RGBA")
-            try:
-                resamp = Image.Resampling.LANCZOS
-            except AttributeError:
-                resamp = 1
-            logo.thumbnail((header_h - 20, header_h - 20), resamp)
-            img.paste(logo, (20, 15), mask=logo)
-        except Exception:
-            pass
+    logo = load_distro_logo(logo_name, header_h - 20)
+    logo_right = 20
+    if logo:
+        img.paste(logo, (20, 15), mask=logo)
+        logo_right = 20 + logo.width + 8
 
-    # Info OS + Hostname + Kernel
-    d.text((100, 15), f"{pretty_name}", fill=theme_colors["text_main"], font=font_lg)
-    # Mostrando kernel junto 
-    d.text((100, 50), f"Host: {SYSTEM_STATS['hostname']} | Kernel: {SYSTEM_STATS['kernel']}", fill=theme_colors["text_muted"], font=font_sm)
+    # Info OS + Hostname + Kernel (posicionar logo do logo)
+    d.text((logo_right, 14), f"{pretty_name}", fill=theme_colors["text_main"], font=font_lg)
+    _subtitle = f"{SYSTEM_STATS['hostname']} | {SYSTEM_STATS['kernel']}"
+    if len(_subtitle) > 44:
+        _subtitle = _subtitle[:44]
+    d.text((logo_right, 36), _subtitle, fill=theme_colors["text_muted"], font=font_sm)
 
     # Relógio MENOR
     now = datetime.now().strftime("%H:%M")
@@ -1620,13 +1885,13 @@ def render_dashboard_landscape(width, height, settings):
     
     net_str = f"  {SYSTEM_STATS['net_rx_mbps']:.1f} Mbps      {SYSTEM_STATS['net_tx_mbps']:.1f} Mbps"
     net_w = get_text_width(d, net_str, font_sm)
-    d.text((width - net_w - 20, 55), net_str, fill=theme_colors["good"], font=font_sm)
+    d.text((width - net_w - 20, 36), net_str, fill=theme_colors["good"], font=font_sm)
     
     if net_rx_icon:
-        img.paste(net_rx_icon, (int(width - net_w - 30), 55), net_rx_icon)
+        img.paste(net_rx_icon, (int(width - net_w - 30), 36), net_rx_icon)
     if net_tx_icon:
         middle_offset = get_text_width(d, f"  {SYSTEM_STATS['net_rx_mbps']:.1f} Mbps    ", font_sm)
-        img.paste(net_tx_icon, (int(width - net_w - 30 + middle_offset), 55), net_tx_icon)
+        img.paste(net_tx_icon, (int(width - net_w - 30 + middle_offset), 36), net_tx_icon)
 
     # === FUNCAO PROGRESS BAR ===
     def draw_bar(x, y, w, h, percent, label, text_val, color, icon_name=""):
@@ -1641,16 +1906,18 @@ def render_dashboard_landscape(width, height, settings):
         val_w = get_text_width(d, text_val, font=font_md)
         d.text((x + w - val_w, y), text_val, fill=theme_colors["text_main"], font=font_md)
         
-        by = y + 27
+        by = y + 18
         try:
             d.rounded_rectangle((x, by, x + w, by + h), radius=h//2, fill=theme_colors["bar_bg"])
             fill_w = int(w * (percent / 100))
-            if fill_w > h:
+            if fill_w > 0:
+                fill_w = max(fill_w, h)  # minimum width = bar height for rounded shape
                 d.rounded_rectangle((x, by, x + fill_w, by + h), radius=h//2, fill=color)
         except AttributeError:
             d.rectangle((x, by, x + w, by + h), fill=theme_colors["bar_bg"])
             fill_w = int(w * (percent / 100))
-            if fill_w > h:
+            if fill_w > 0:
+                fill_w = max(fill_w, h)
                 d.rectangle((x, by, x + fill_w, by + h), fill=color)
 
     # === 2. LEFT COLUMN (HARDWARE) ===
@@ -1686,12 +1953,13 @@ def render_dashboard_landscape(width, height, settings):
     d.text((col1_x + half_w - val_w, bar_y), f"{SYSTEM_STATS['cpu_percent']:.1f}%", fill=theme_colors["text_main"], font=font_md)
     
     # Barra CPU
-    by = bar_y + 27
+    by = bar_y + 18
     h_bar = int(height * 0.025)
     try:
         d.rounded_rectangle((col1_x, by, col1_x + half_w, by + h_bar), radius=h_bar//2, fill=theme_colors["bar_bg"])
         fcpu = int(half_w * (SYSTEM_STATS["cpu_percent"] / 100))
-        if fcpu > h_bar:
+        if fcpu > 0:
+            fcpu = max(fcpu, h_bar)  # minimum width = bar height for rounded shape
             d.rounded_rectangle((col1_x, by, col1_x + fcpu, by + h_bar), radius=h_bar//2, fill=theme_colors["warn"])
     except AttributeError:
         pass
@@ -1824,9 +2092,9 @@ def render_dashboard_landscape(width, height, settings):
     proc_icon = get_svg_icon("process-symbolic.svg", int(height*0.045), theme_colors["icon_color"])
     if proc_icon:
         img.paste(proc_icon, (col2_x + 15, header_h + 18), proc_icon)
-        d.text((col2_x + 15 + proc_icon.width + 8, header_h + 20), "TOP 10 PROCESSOS | CPU | MEM", fill=theme_colors["text_muted"], font=font_md)
+        d.text((col2_x + 15 + proc_icon.width + 8, header_h + 20), "TOP 10 PROCESSOS | CPU | MEM", fill=theme_colors["text_muted"], font=font_sm)
     else:
-        d.text((col2_x + 15, header_h + 20), "TOP 10 PROCESSOS | CPU | MEM)", fill=theme_colors["text_muted"], font=font_md)
+        d.text((col2_x + 15, header_h + 20), "TOP 10 PROCESSOS | CPU | MEM", fill=theme_colors["text_muted"], font=font_sm)
     d.line((col2_x + 15, header_h + 50, width - 25, header_h + 50), fill=theme_colors["border"], width=2)
     
     py = header_h + 60
@@ -1845,17 +2113,17 @@ def render_dashboard_landscape(width, height, settings):
         color = theme_colors["crit"] if i < 2 else (theme_colors["warn"] if i < 5 else (theme_colors["text_label"] if i < 8 else theme_colors["good"]))
         
         # Numeração
-        d.text((col2_x + 15, py), f"{i+1}.", fill=theme_colors["text_muted"], font=font_sm)
+        d.text((col2_x + 15, py), f"{i+1}.", fill=theme_colors["text_muted"], font=font_proc)
         # Nome
-        d.text((col2_x + 45, py), p_name, fill=color, font=font_sm)
+        d.text((col2_x + 40, py), p_name, fill=color, font=font_proc)
         
         # CPU alinhado à direita (penúltima coluna)
-        cpu_w = get_text_width(d, p_cpu, font=font_sm)
-        d.text((width - 95 - cpu_w, py), f"{p_cpu}", fill=color, font=font_sm)
+        cpu_w = get_text_width(d, p_cpu, font=font_proc)
+        d.text((width - 85 - cpu_w, py), f"{p_cpu}", fill=color, font=font_proc)
         
         # MEM alinhado à direita (última coluna)
-        mem_w = get_text_width(d, p_mem, font=font_sm)
-        d.text((width - 25 - mem_w, py), f"{p_mem}", fill=color, font=font_sm)
+        mem_w = get_text_width(d, p_mem, font=font_proc)
+        d.text((width - 25 - mem_w, py), f"{p_mem}", fill=color, font=font_proc)
         
         py += step_y
 
@@ -1863,7 +2131,7 @@ def render_dashboard_landscape(width, height, settings):
 
 
 def animate_intro(lcd, settings):
-    # Determine orientation dimensions
+    """Show a quick intro logo splash, optimised for slow serial displays."""
     is_vertical = settings.get("orientation") == "vertical"
     if is_vertical:
         width, height = lcd.height, lcd.width
@@ -1871,107 +2139,45 @@ def animate_intro(lcd, settings):
         width, height = lcd.width, lcd.height
     theme_colors = get_theme_colors(settings.get("theme", "dark"))
     bg_color = theme_colors["bg"]
-    
+
     possible_paths = [
         os.path.abspath(os.path.join(BASE_DIR, "..", "icons", "hicolor", "scalable", "apps", "big-screen-monitor-display.svg")),
         "/usr/share/icons/hicolor/scalable/apps/big-screen-monitor-display.svg"
     ]
-    
+
     logo_path = None
     for p in possible_paths:
         if os.path.exists(p):
             logo_path = p
             break
-            
+
     if not logo_path:
         return
-        
-    # Scale logo proportionally: 50% of height in landscape, 30% in portrait
+
     max_h = int(height * 0.3) if is_vertical else int(height * 0.5)
     try:
-        p = subprocess.run(["rsvg-convert", "-h", str(max_h), logo_path], 
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.run(["rsvg-convert", "-h", str(max_h), logo_path],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
         if p.returncode != 0:
             return
         base_logo = Image.open(io.BytesIO(p.stdout)).convert("RGBA")
     except Exception:
         return
-    frames_in = 8
-    frames_hold = 8
-    frames_out = 6
-    
-    pre_rendered_frames = []
-    
-    def blend_and_generate(scale, alpha):
-        img = Image.new('RGB', (width, height), color=bg_color)
-        cw, ch = base_logo.size
-        nw, nh = int(cw * scale), int(ch * scale)
-        if nw > 0 and nh > 0:
-            try:
-                resamp = Image.Resampling.LANCZOS
-            except AttributeError:
-                resamp = 1
-                
-            scaled = base_logo.resize((nw, nh), resamp)
-            
-            r, g, b, a = scaled.split()
-            a = a.point(lambda p: int(p * (alpha / 255.0)))
-            scaled.putalpha(a)
-            
-            x = (width - nw) // 2
-            y = (height - nh) // 2
-            img.paste(scaled, (x, y), scaled)
-            
-        # Hardware-bound rotation
-        if is_vertical:
-            final_img = img.rotate(90, expand=True)
-        else:
-            final_img = img
-            
-        dw, dh = final_img.size
-        img_bytes = final_img.convert("RGB").tobytes()
-        rgb565 = bytearray(dw * dh * 2)
-        for i in range(dw * dh):
-            r, g, b = img_bytes[i*3:i*3+3]
-            val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-            rgb565[i*2] = (val >> 8) & 0xFF
-            rgb565[i*2+1] = val & 0xFF
-            
-        pre_rendered_frames.append((rgb565, dw, dh))
-        
-    for i in range(1, frames_in + 1):
-        progress = i / frames_in
-        ease_out = 1 - (1 - progress) * (1 - progress)
-        blend_and_generate(0.5 + 0.5 * ease_out, int(255 * progress))
-        
-    hold_frame_data = pre_rendered_frames[-1]
-        
-    for i in range(frames_out, -1, -1):
-        progress = i / frames_out
-        blend_and_generate(1.0, int(255 * progress))
-        
-    for frame_data in pre_rendered_frames[:frames_in]:
-        lcd._draw_rgb565(frame_data[0], frame_data[1], frame_data[2])
-        
-    for _ in range(frames_hold):
-        lcd._draw_rgb565(hold_frame_data[0], hold_frame_data[1], hold_frame_data[2])
-        
-    for frame_data in pre_rendered_frames[frames_in:]:
-        lcd._draw_rgb565(frame_data[0], frame_data[1], frame_data[2])
-    
-    # Final bg fill for cleanup
+
+    # Single splash frame: logo centred on background
+    img = Image.new('RGB', (width, height), color=bg_color)
+    lw, lh = base_logo.size
+    x = (width - lw) // 2
+    y = (height - lh) // 2
+    img.paste(base_logo, (x, y), base_logo)
+
+    # Use the efficient draw() path (numpy RGB565, tile-based)
+    lcd.draw(img, settings)
+
+    # Hold for a moment, then clear with background
+    time.sleep(0.5)
     bg_img = Image.new('RGB', (width, height), color=bg_color)
-    if is_vertical:
-        bg_img = bg_img.rotate(90, expand=True)
-    dw, dh = bg_img.size
-    bg_bytes = bg_img.convert("RGB").tobytes()
-    bg_565 = bytearray(dw * dh * 2)
-    for i in range(dw * dh):
-        r, g, b = bg_bytes[i*3:i*3+3]
-        val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        bg_565[i*2] = (val >> 8) & 0xFF
-        bg_565[i*2+1] = val & 0xFF
-    lcd._draw_rgb565(bg_565, dw, dh)
+    lcd.draw(bg_img, settings)
 
 def run_tray_icon():
     if pystray is None or os.getuid() == 0 or not os.environ.get("DISPLAY"):
@@ -2027,10 +2233,11 @@ def main():
     print(f"   • Tema de Interface: {settings.get('theme', 'dark')}")
     print(f"   • Conexão de Rede: {settings.get('network_iface', 'auto')}")
     
-    print("\n⚡ Conectando ao hardware do Display (USB AX206)...")
+    print("\n⚡ Conectando ao hardware do Display...")
     try:
-        lcd = AX206_DPF()
-        print(f"✅ Sucesso: Display detectado ({lcd.width}x{lcd.height})")
+        lcd = detect_display(settings)
+        driver_name = type(lcd).__name__
+        print(f"✅ Sucesso: Display detectado via {driver_name} ({lcd.width}x{lcd.height})")
     except Exception as e:
         print(f"❌ Falha crítica: Não foi possível acessar o display USB.")
         print(f"   Dica: Verifique se o cabo está conectado ou se tem permissões udev.")
@@ -2062,6 +2269,7 @@ def main():
                 # Dispara a intro se a orientação mudar dinamicamente
                 if new_settings.get("orientation") != settings.get("orientation"):
                     animate_intro(lcd, new_settings)
+                    lcd._prev_frame = None  # Force full redraw after orientation change
                     
                 settings = new_settings
                 last_check = now
@@ -2073,8 +2281,13 @@ def main():
                 render_w, render_height = lcd.width, lcd.height
                 
             img = render_dashboard(render_w, render_height, settings)
-            lcd.draw(img, settings)
-            time.sleep(0.5)
+            updated = lcd.draw(img, settings)
+            # Adaptive sleep: short if data was sent (serial is the bottleneck),
+            # longer if nothing changed (avoid busy-looping render+compare)
+            if updated:
+                time.sleep(0.01)
+            else:
+                time.sleep(0.25)
     except KeyboardInterrupt:
         lcd.set_backlight(0)
 

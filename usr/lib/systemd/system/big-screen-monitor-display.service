@@ -6,6 +6,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=root
+SupplementaryGroups=uucp
 WorkingDirectory=/usr/share/big-screen-monitor-display
 ExecStart=/usr/bin/big-screen-monitor-display.sh
 Environment=PYTHONUNBUFFERED=1
