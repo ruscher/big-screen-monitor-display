@@ -158,9 +158,9 @@ class BigScreenConfigWindow(Adw.ApplicationWindow):
         page.add(group_system)
 
         # Tema
-        theme_model = Gtk.StringList.new(["Escuro (Dark)", "Claro (Light)", "Neon", "Cyberpunk", "GKrellM"])
+        theme_model = Gtk.StringList.new(["Escuro (Dark)", "Claro (Light)", "Neon", "Cyberpunk", "GKrellM", "Planet", "Old Computer"])
         self.combo_theme = Adw.ComboRow(title="Tema de Interface", subtitle="Cores da Tela", model=theme_model)
-        theme_map = {"dark": 0, "light": 1, "neon": 2, "cyberpunk": 3, "gkrellm": 4}
+        theme_map = {"dark": 0, "light": 1, "neon": 2, "cyberpunk": 3, "gkrellm": 4, "planet": 5, "old_computer": 6}
         self.combo_theme.set_selected(theme_map.get(self.settings.get("theme", "dark"), 0))
         group_system.add(self.combo_theme)
 
@@ -295,7 +295,7 @@ class BigScreenConfigWindow(Adw.ApplicationWindow):
     def _get_current_settings(self):
         model_map = {0: "auto", 1: "ax206", 2: "turing", 3: "other"}
         size_map = {0: "3.5", 1: "5", 2: "8.8", 3: "2.1"}
-        theme_map = {0: "dark", 1: "light", 2: "neon", 3: "cyberpunk", 4: "gkrellm"}
+        theme_map = {0: "dark", 1: "light", 2: "neon", 3: "cyberpunk", 4: "gkrellm", 5: "planet", 6: "old_computer"}
         net_map = {0: "auto", 1: "eth", 2: "wifi"}
 
         res = {
@@ -390,17 +390,33 @@ class BigScreenConfigWindow(Adw.ApplicationWindow):
         
         self.show_feedback("Padrões aplicados. Clique em Salvar e Reiniciar para efetivar.")
 
-    def _async_service_cmd(self, action, use_pkexec, cb):
+    def _async_service_cmd(self, action, cb):
+        """Run only the service actions granted by the sudoers drop-in.
+
+        ``-n`` is intentional: the configuration window must never open a
+        terminal/password prompt. If the administrator has not installed the
+        project sudoers rule yet, the operation fails with a clear message.
+        """
+        allowed_actions = {"restart", "enable", "disable"}
+        if action not in allowed_actions:
+            GLib.idle_add(cb, False, f"Ação de serviço não permitida: {action}")
+            return
+
         def worker():
             try:
-                if use_pkexec:
-                    subprocess.Popen(["pkexec", "systemctl", action, "big-screen-monitor-display.service"])
-                    GLib.idle_add(cb, True, "Prompt de autorização enviado.")
-                else:
-                    res = subprocess.run(["systemctl", action, "big-screen-monitor-display.service"], capture_output=True, text=True, timeout=10)
-                    success = res.returncode == 0
-                    msg = "Sucesso" if success else f"Falha: {res.stderr}"
-                    GLib.idle_add(cb, success, msg)
+                command = ["sudo", "-n", "/usr/bin/systemctl", action,
+                           "big-screen-monitor-display.service"]
+                res = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                success = res.returncode == 0
+                output = (res.stdout or res.stderr or "").strip()
+                permission_error = any(phrase in output.lower() for phrase in (
+                    "password is required", "a terminal is required", "not allowed",
+                    "não é permitido", "senha é necessária"))
+                msg = "Sucesso" if success else (
+                    "Permissão sem senha não configurada. Instale o arquivo "
+                    "sudoers do Big Screen Monitor."
+                    if res.returncode == 1 and (not output or permission_error) else f"Falha: {output}")
+                GLib.idle_add(cb, success, msg)
             except Exception as e:
                 GLib.idle_add(cb, False, f"Erro: {str(e)}")
         threading.Thread(target=worker, daemon=True).start()
@@ -415,15 +431,14 @@ class BigScreenConfigWindow(Adw.ApplicationWindow):
         
         def on_result(success, msg):
             self.btn_apply_restart.set_sensitive(True)
-            if success and "autorização" not in msg:
+            if success:
                 self.show_feedback("✔ Reiniciado com sucesso!")
                 self.btn_apply_restart.set_label("✔ Salvo!")
                 GLib.timeout_add(3000, lambda: self.btn_apply_restart.set_label("Salvar e Reiniciar"))
-            elif not success:
-                # Tenta pkexec como fallback se systemctl restart falhou
-                self._async_service_cmd("restart", True, lambda s, m: self.show_feedback(m))
+            else:
+                self.show_feedback(msg)
         
-        self._async_service_cmd("restart", False, on_result)
+        self._async_service_cmd("restart", on_result)
 
     def check_service_status(self):
         try:
@@ -442,12 +457,12 @@ class BigScreenConfigWindow(Adw.ApplicationWindow):
         
         def on_result(success, msg):
             self.switch_startup.set_sensitive(True)
-            if success and "autorização" not in msg:
+            if success:
                 self.show_feedback(f"Serviço de inicialização: {cmd} aplicado com sucesso.")
-            elif not success:
-                self._async_service_cmd(cmd, True, lambda s, m: self.show_feedback(m))
+            else:
+                self.show_feedback(msg)
                 
-        self._async_service_cmd(cmd, False, on_result)
+        self._async_service_cmd(cmd, on_result)
 
 class BigScreenConfigApp(Adw.Application):
     def __init__(self):

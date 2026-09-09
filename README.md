@@ -49,6 +49,7 @@ Esta versão marca um salto qualitativo no monitoramento, trazendo recursos avan
 - 🖥️ **Suporte a Turing Smart Screen (TURZX):** Compatibilidade total com displays USB Serial 3.5" baseados em QinHeng Electronics, com driver nativo e detecção automática.
 - 🔄 **Orientação Dinâmica:** Troca entre horizontal e vertical em tempo real, com redesenho completo automático ao mudar de orientação.
 - 🎨 **Temas Dinâmicos:** Inclui o modo **GKrellM**, com sub-estilos como *Urlicht (Neon Blue)*, *Classic (Fósforo Verde)* e *Cyber-Red*, além do tema **Cyberpunk**.
+- 🌍 **Tema Planet:** Interface orbital em azul-neon com versões horizontal e vertical, textura terrestre detalhada, globo orientado pelo tempo sideral, posição real calculada do Sol e da Lua, órbita lunar com fase iluminada, trilhas das próximas 24 horas, terminador solar, telemetria de CPU/GPU, gauges de temperatura, rede e donut de uso da RAM.
 - 📊 **Gráfico de CPU Avançado:** Visualização em ondas que se movem da direita para a esquerda, com camadas sobrepostas diferenciando o uso de **Usuário** (User Space) e **Sistema** (Kernel Space).
 - 🎮 **Suporte Multi-GPU:** Monitoramento completo de múltiplas placas de vídeo simultâneas (AMD, Intel, NVIDIA) com sensores de temperatura, memória, potência (PPT) e carga de Encode/Decode.
 - 🔠 **Letreiro Marquee:** Nomes grandes de GPUs ou do Kernel agora passam como um letreiro deslizante (bounce effect) para garantir visibilidade total.
