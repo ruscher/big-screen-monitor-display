@@ -66,8 +66,15 @@ def outputs():
 def main(argv):
     files = outputs()
     if "--check" in argv:
-        stale = [path for path, text in files.items()
-                 if not os.path.exists(path) or open(path, encoding="utf-8").read() != text]
+        # makepkg rewrites "pkgver=" with the git version (5.6.1.r5.gabc1234) on every
+        # local build of a -git package: that line is not a difference.
+        def same(path, text):
+            if not os.path.exists(path):
+                return False
+            with open(path, encoding="utf-8") as fh:
+                current = fh.read()
+            return re.sub(r"(?m)^pkgver=.*$", "pkgver=", current) == re.sub(r"(?m)^pkgver=.*$", "pkgver=", text)
+        stale = [path for path, text in files.items() if not same(path, text)]
         if stale:
             print("pkgbuild/aur desatualizado: rode tools/make_aur.py", file=sys.stderr)
             return 1

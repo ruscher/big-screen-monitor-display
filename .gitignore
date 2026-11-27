@@ -10,3 +10,12 @@ device-clients/palmos/palm/resources.stamp
 # coverage data only (.coveragerc is the configuration and is versioned)
 .coverage
 .coverage.*
+# makepkg in pkgbuild/ or pkgbuild/aur/ (the git clone, build dirs, packages)
+pkgbuild/src/
+pkgbuild/pkg/
+pkgbuild/*.pkg.tar*
+pkgbuild/big-screen-monitor-display/
+pkgbuild/aur/src/
+pkgbuild/aur/pkg/
+pkgbuild/aur/*.pkg.tar*
+pkgbuild/aur/big-screen-monitor-display/
